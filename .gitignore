@@ -1,0 +1,21 @@
+# PyInstaller output — regenerate with: py -m PyInstaller --noconfirm Markdown2PDF.spec
+build/
+dist/
+*.manifest
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Local conversion output
+*.pdf
+!docs/**/*.pdf
