@@ -38,6 +38,9 @@ ERR = "#DC2626"
 MD2PDF = "Markdown → PDF"
 PDF2MD = "PDF → Markdown"
 
+MD_EXTS = (".md", ".markdown", ".mdown", ".mkd", ".txt")
+PDF_EXTS = (".pdf",)
+
 SVG_INLINE = "Inline  <svg>"
 SVG_LINKED = "Linked .svg files"
 SVG_NOTE = {
@@ -59,6 +62,116 @@ def resource_path(rel: str) -> str:
     return os.path.join(base, rel)
 
 
+# ---------------------------------------------------------- drag and drop ---
+# Tk has no drag-and-drop of its own, and tkdnd is a native Tcl extension —
+# exactly the kind of thing this project keeps out of the PyInstaller build.
+# So on Windows we go straight to the shell: mark the toplevel
+# WS_EX_ACCEPTFILES and subclass its window procedure to read WM_DROPFILES.
+# Pure ctypes, nothing to bundle. Anywhere else the app simply has no drop
+# target and Browse still works.
+
+WM_DROPFILES = 0x0233
+GWLP_WNDPROC = -4
+GA_ROOT = 2
+DRAG_QUERY_COUNT = 0xFFFFFFFF
+
+
+def enable_file_drop(window, on_files) -> bool:
+    """Let files be dropped on `window`; `on_files` gets a list of paths.
+
+    `on_files` runs *inside the window procedure* and **must not touch Tk** —
+    see the note on the handler below. Hand the paths to the Tk side through
+    something inert, like a queue.
+
+    Returns False — quietly — on any platform or setup where that can't be
+    arranged, so the caller can fall back to Browse alone.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+
+        LRESULT = ctypes.c_ssize_t
+        WPARAM, LPARAM = ctypes.c_size_t, ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                     WPARAM, LPARAM)
+
+        # SetWindowLongPtrW only exists in 64-bit user32; the 32-bit name is
+        # the plain one and is pointer-sized there anyway.
+        set_long = getattr(user32, "SetWindowLongPtrW", None) or user32.SetWindowLongW
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, WNDPROC]
+        set_long.restype = LRESULT
+        user32.CallWindowProcW.argtypes = [LRESULT, wintypes.HWND,
+                                           wintypes.UINT, WPARAM, LPARAM]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT,
+                                           wintypes.LPWSTR, wintypes.UINT]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragFinish.argtypes = [wintypes.HANDLE]
+
+        window.update_idletasks()
+        child = window.winfo_id()
+        # Tk wraps the toplevel, and the drop has to land on the real one —
+        # the shell walks up from the window under the cursor looking for the
+        # accept-files style, so registering the root covers every widget.
+        hwnd = user32.GetAncestor(child, GA_ROOT) or child
+
+        # Two rules in here, both learned the hard way:
+        #
+        # 1. Touch nothing belonging to Tk — not even `after()`. Tk's mainloop
+        #    releases the GIL while it waits in Tcl_DoOneEvent, so a real drop
+        #    (posted, and dispatched from inside that wait) reaches this
+        #    callback with no thread state. Plain Python is fine — ctypes
+        #    reacquires the GIL on entry — but re-entering Tcl from here kills
+        #    the interpreter outright: "PyEval_RestoreThread: … the GIL is
+        #    released". Paths go onto a queue and the Tk side collects them.
+        #    A synthetic SendMessage will *not* reproduce this; it arrives on
+        #    the Python side of the loop, with the GIL held.
+        # 2. Nothing may raise: this is Windows' message dispatch, where an
+        #    exception has nowhere to go.
+        def proc(h, msg, wparam, lparam):
+            if msg == WM_DROPFILES:
+                paths = []
+                try:
+                    for i in range(shell32.DragQueryFileW(
+                            wparam, DRAG_QUERY_COUNT, None, 0)):
+                        # ask for the length first — paths can exceed MAX_PATH
+                        size = shell32.DragQueryFileW(wparam, i, None, 0) + 1
+                        buf = ctypes.create_unicode_buffer(size)
+                        if shell32.DragQueryFileW(wparam, i, buf, size):
+                            paths.append(buf.value)
+                    if paths:
+                        on_files(paths)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        shell32.DragFinish(wparam)
+                    except Exception:
+                        pass
+                return 0
+            return user32.CallWindowProcW(old, h, msg, wparam, lparam)
+
+        boxed = WNDPROC(proc)
+        old = set_long(hwnd, GWLP_WNDPROC, boxed)
+        if not old:
+            return False
+        shell32.DragAcceptFiles(hwnd, True)
+        # the callback is only referenced by Windows from here on; without a
+        # Python reference it is collected and the next message crashes
+        window._drop_proc = boxed
+        return True
+    except Exception:
+        return False
+
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__(fg_color=BG)
@@ -74,6 +187,9 @@ class App(ctk.CTk):
             pass
 
         self._queue: queue.Queue = queue.Queue()
+        # filled by the window procedure, drained by _poll — the drop handler
+        # runs where Tk cannot be touched, so this is the only way across
+        self._drops: queue.Queue = queue.Queue()
         self._last_out: str | None = None
         self._fonts = engine.list_font_families() or ["Helvetica (built-in)"]
         # Aptos ships with Office, so fall back to whatever this machine has
@@ -118,7 +234,7 @@ class App(ctk.CTk):
 
         self.file_row = ctk.CTkFrame(src, fg_color="transparent")
         self.file_row.pack(fill="x", padx=16, pady=(0, 14))
-        self.in_entry = self._entry(self.file_row, "Choose a .md file…")
+        self.in_entry = self._entry(self.file_row, self._input_placeholder(True))
         self.in_entry.pack(side="left", fill="x", expand=True)
         ctk.CTkButton(self.file_row, text="Browse", width=92,
                       command=self._browse_input,
@@ -289,6 +405,11 @@ class App(ctk.CTk):
         self._apply_direction(MD2PDF)
         self._paint_segments(self.direction)
         self._paint_segments(self.src_mode)
+        self._dnd = enable_file_drop(self, self._drops.put)
+        if self._dnd:
+            self.in_entry.configure(placeholder_text=self._input_placeholder(True))
+            self._set_status("Tip — drop a .md or .pdf file anywhere on this "
+                             "window to load it.", SUBTEXT)
         self.after(120, self._poll)
 
     # ------------------------------------------------------------ widgets --
@@ -340,6 +461,13 @@ class App(ctk.CTk):
     def _is_md2pdf(self) -> bool:
         return self.direction.get() == MD2PDF
 
+    def _input_placeholder(self, md: bool) -> str:
+        ext = ".md" if md else ".pdf"
+        # _dnd is only known once the window exists, so the first call (while
+        # the entry is being built) gets the plain wording and is refreshed
+        return (f"Drop a {ext} file here, or Browse…"
+                if getattr(self, "_dnd", False) else f"Choose a {ext} file…")
+
     def _switch_direction(self, mode):
         self._paint_segments(self.direction)
         self._apply_direction(mode)
@@ -355,12 +483,11 @@ class App(ctk.CTk):
         if md:
             self.src_mode.pack(anchor="w", padx=16, pady=(4, 10))
             self._switch_source(self.src_mode.get())
-            self.in_entry.configure(placeholder_text="Choose a .md file…")
         else:
             self.src_mode.pack_forget()
             self.paste_box.pack_forget()
             self.file_row.pack(fill="x", padx=16, pady=(0, 14))
-            self.in_entry.configure(placeholder_text="Choose a .pdf file…")
+        self.in_entry.configure(placeholder_text=self._input_placeholder(md))
         # options card
         if md:
             self.opts_pdf.pack_forget()
@@ -420,11 +547,40 @@ class App(ctk.CTk):
                 filetypes=[("PDF", "*.pdf"), ("All files", "*.*")])
             new_ext = ".md"
         if path:
-            self.in_entry.delete(0, "end")
-            self.in_entry.insert(0, path)
-            # keep the output path in step with the chosen file
-            self.out_entry.delete(0, "end")
-            self.out_entry.insert(0, os.path.splitext(path)[0] + new_ext)
+            self._load_input(path, new_ext)
+
+    def _load_input(self, path, out_ext):
+        self.in_entry.delete(0, "end")
+        self.in_entry.insert(0, path)
+        # keep the output path in step with the chosen file
+        self.out_entry.delete(0, "end")
+        self.out_entry.insert(0, os.path.splitext(path)[0] + out_ext)
+
+    def _files_dropped(self, paths):
+        """A file (or several) was dropped on the window."""
+        usable = [p for p in paths
+                  if os.path.isfile(p) and p.lower().endswith(MD_EXTS + PDF_EXTS)]
+        if not usable:
+            name = os.path.basename(paths[0]) if paths else ""
+            self._set_status(f"{name} isn't a .md or .pdf file." if name
+                             else "Drop a .md or .pdf file.", ERR)
+            return
+
+        path = usable[0]
+        is_pdf = path.lower().endswith(PDF_EXTS)
+        # the dropped file decides which way we're converting
+        want = PDF2MD if is_pdf else MD2PDF
+        if self.direction.get() != want:
+            self.direction.set(want)
+            self._switch_direction(want)
+        if not is_pdf and self.src_mode.get() != "Markdown file":
+            self.src_mode.set("Markdown file")
+            self._switch_source("Markdown file")
+
+        self._load_input(path, ".md" if is_pdf else ".pdf")
+        self.result_row.pack_forget()
+        extra = "" if len(usable) == 1 else f"   (dropped {len(usable)}, took the first)"
+        self._set_status(f"Loaded  {os.path.basename(path)}{extra}", SUBTEXT)
 
     def _browse_output(self):
         md = self._is_md2pdf()
@@ -542,6 +698,14 @@ class App(ctk.CTk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _poll(self):
+        # dropped files land here rather than in the window procedure, which
+        # is the one place Tk must not be called from
+        try:
+            while True:
+                self._files_dropped(self._drops.get_nowait())
+        except queue.Empty:
+            pass
+
         try:
             kind, payload, extra = self._queue.get_nowait()
         except queue.Empty:

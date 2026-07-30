@@ -12,6 +12,14 @@ A light-themed desktop app that converts in **both directions**:
 Switch direction with the toggle at the top of the window; the options adapt
 to whichever way you're converting.
 
+**Drag and drop** — drop a `.md` or `.pdf` anywhere on the window instead of
+browsing for it. The file picks the direction: drop a PDF and the app flips to
+PDF → Markdown, drop markdown and it flips back (and out of *Paste text* mode
+if you were in it). The output path follows the dropped file. Drop several and
+the first usable one wins; anything that isn't markdown or PDF is refused
+without disturbing the current selection. Windows only — elsewhere **Browse**
+is still there.
+
 ## Markdown → PDF
 
 - **Headings** — styled and scaled relative to your chosen base size, with

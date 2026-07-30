@@ -95,6 +95,41 @@ serial numbers.
 - **Comment density is low and explanatory** — short `# ----- section -----`
   banners, and comments that say *why*, not *what*.
 
+## md2pdf_app.py — drag and drop
+
+`enable_file_drop()` is the whole mechanism. Tk has no drag-and-drop, and the
+usual answer (`tkinterdnd2`) ships a native tkdnd Tcl extension — banned by the
+pure-Python rule above. So it goes through the Win32 shell instead:
+`DragAcceptFiles` on the toplevel plus a `SetWindowLongPtrW` subclass of its
+window procedure that handles `WM_DROPFILES`, all via `ctypes`. Nothing extra
+to bundle, and `enable_file_drop()` returns False rather than raising anywhere
+it can't be set up, so non-Windows keeps working with Browse alone.
+
+Two things there are load-bearing.
+
+**The callback must not touch Tk — not even `after()`.** Tk's mainloop
+releases the GIL while it waits in `Tcl_DoOneEvent`, and a real drop is
+*posted*, so it is dispatched from inside that wait and reaches the callback
+with no thread state. Plain Python is fine (ctypes reacquires the GIL on
+entry), but re-entering Tcl from there kills the interpreter on the first
+drop: `Fatal Python error: PyEval_RestoreThread: … the GIL is released`. So
+the callback only does `self._drops.put(paths)`, and `_poll()` — already
+ticking every 120 ms in proper Tk context — drains it.
+
+The trap is that this is invisible to the obvious test: a synthetic
+`SendMessage` from Python arrives with the GIL held and passes happily. Only a
+**posted** message dispatched from inside a running `mainloop` reproduces it:
+`PostMessageW(hwnd, WM_DROPFILES, hdrop, 0)` from an `after()` timer, with the
+app in `mainloop()` — building the `HDROP` by hand in global memory.
+
+**The boxed `WNDPROC` is kept alive on `window._drop_proc`.** Windows holds
+the only other reference, so without it the callback is collected and the next
+message takes the process down. Nothing inside the callback may raise either —
+it runs where an exception has nowhere to go.
+
+`ctypes.wintypes` is imported *inside* the function; importing it at module
+level raises on non-Windows.
+
 ## pdf2md_engine.py
 
 `pymupdf4llm` is pinned to **0.0.27** in requirements.txt on purpose — 1.x
