@@ -37,9 +37,18 @@ exercises the features and inspecting the PDF — PyMuPDF comes in via
 `pymupdf4llm`, so pages can be rasterised to PNG and read back. A good
 stress document needs `\pagebreak` markers, SVGs (inline and linked), several
 tables and some long fenced blocks. The one this was built against lives
-outside the repo at `..\MD_To_PDF_Project\cr1140-qt-guide.md`; it is not
-committed because it contains an internal IP, an SSH password and device
-serial numbers.
+outside the repo at `..\mdtopdf_ref_files\cr1140-qt-guide.md`, with its linked
+`diagrams\*.svg`; it is not committed because it contains an internal IP, an
+SSH password and device serial numbers.
+
+## Who uses this
+
+This app is the supported way the **CR1140 starter kit's** docs get their PDFs.
+When any `.md` under `..\..\Qt\CR1140_Starter_Kit\docs\` (or that kit's
+`START_HERE.md`) changes, the `.pdf` beside it is regenerated here — not by
+hand and not with another converter, so the whole set keeps one look. The
+`mdtopdf_ref_files` copy above is an older snapshot of that same guide, kept as
+a rendering stress test rather than as the live document.
 
 ## md2pdf_engine.py — how it fits together
 
