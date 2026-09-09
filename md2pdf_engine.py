@@ -1493,7 +1493,9 @@ class _Renderer:
     # ---- code blocks ----
 
     def _code_block(self, node) -> list:
-        code = node.content.replace("\t", "    ").rstrip("\n")
+        # expandtabs advances to the next tab stop and restarts at each newline,
+        # so tab-aligned code (Structured Text, Makefiles) keeps its columns.
+        code = node.content.expandtabs(4).rstrip("\n")
         if not code.strip():
             return []
         lang = (node.info or "").strip().split()[0] if node.info else ""
